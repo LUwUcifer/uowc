@@ -19,18 +19,17 @@ func newCrawledSet() *crawledSet {
 	}
 }
 
-func (cs *crawledSet) add(url string) {
+func (cs *crawledSet) addIfAbsent(url string) bool {
 	cs.mutex.Lock()
 	defer cs.mutex.Unlock()
-	cs.data[hashURL(url)] = true
+	h := hashURL(url)
+	_, ok := cs.data[h]
+	if ok {
+		return false
+	}
+	cs.data[h] = true
 	cs.number++
-}
-
-func (cs *crawledSet) contains(url string) bool {
-	cs.mutex.Lock()
-	defer cs.mutex.Unlock()
-	_, ok := cs.data[hashURL(url)]
-	return ok
+	return true
 }
 
 func (cs *crawledSet) size() int {
