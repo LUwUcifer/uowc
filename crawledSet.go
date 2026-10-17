@@ -1,7 +1,6 @@
 package main
 
 import (
-	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -60,11 +59,13 @@ func (cs *crawledSet) size() int {
 	return int(cs.number.Load())
 }
 
+// fnv.New64a() allocates a new hasher per call
+// inline hashing function prevents copy overhead
 func hashURL(url string) uint64 {
-	h := fnv.New64a()
-	_, err := h.Write([]byte(url))
-	if err != nil {
-		return 0
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(url); i++ {
+		h ^= uint64(url[i])
+		h *= 1099511628211
 	}
-	return h.Sum64()
+	return h
 }
