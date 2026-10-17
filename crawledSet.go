@@ -3,39 +3,61 @@ package main
 import (
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 )
 
+// determines whether on 32 or 64 bit architecture
+// extracted from package bits
+const uintSize = 32 << (^uint(0) >> 63) // 32 or 64
+const UintSize = uintSize
+
+// shardCount is the number of paritions a muted is
+// divided into such that mutexes can act independently
+// of each other to increase speed
+const shardCount = 256
+
 type crawledSet struct {
-	data   map[uint64]bool
-	number int
-	mutex  sync.Mutex
+	shards []shard
+	number atomic.Int64
+}
+
+type shard struct {
+	mutex sync.Mutex
+	data  map[uint64]struct{}
+	// Adds padding to prevent performance overhead from false sharing
+	// usenix.org/legacy/publications/library/proceedings/sedms4/full_papers/bolosky.txt
+	_ [UintSize - unsafe.Sizeof(sync.Mutex{}) - 8]byte
 }
 
 func newCrawledSet() *crawledSet {
-	return &crawledSet{
-		data:   make(map[uint64]bool),
-		number: 0,
-		mutex:  sync.Mutex{},
+	s := &crawledSet{
+		shards: make([]shard, shardCount),
 	}
+	for i := range shardCount {
+		s.shards[i] = shard{
+			data: make(map[uint64]struct{}),
+		}
+	}
+	return s
 }
 
 func (cs *crawledSet) addIfAbsent(url string) bool {
-	cs.mutex.Lock()
-	defer cs.mutex.Unlock()
 	h := hashURL(url)
-	_, ok := cs.data[h]
+	s := &cs.shards[h%shardCount]
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	_, ok := s.data[h]
 	if ok {
 		return false
 	}
-	cs.data[h] = true
-	cs.number++
+	s.data[h] = struct{}{}
+	cs.number.Add(1)
 	return true
 }
 
 func (cs *crawledSet) size() int {
-	cs.mutex.Lock()
-	defer cs.mutex.Unlock()
-	return cs.number
+	return int(cs.number.Load())
 }
 
 func hashURL(url string) uint64 {
