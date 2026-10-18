@@ -2,6 +2,8 @@ package internal
 
 import "errors"
 
+const defaultBufferSize uint32 = 1 << 10
+
 type RingBuffer[T any] struct {
 	data []T
 	head uint32
@@ -9,7 +11,11 @@ type RingBuffer[T any] struct {
 	size uint32
 }
 
-func NewRingBuffer[T any](size uint32) *RingBuffer[T] {
+func NewRingBuffer[T any](sizeOptional ...uint32) *RingBuffer[T] {
+	size := defaultBufferSize
+	if len(sizeOptional) > 0 {
+		size = sizeOptional[0]
+	}
 	return &RingBuffer[T]{
 		data: make([]T, size),
 		head: 0,
