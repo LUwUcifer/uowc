@@ -1,4 +1,4 @@
-package main
+package internal
 
 import (
 	"sync"
@@ -11,7 +11,7 @@ import (
 const uintSize = 32 << (^uint(0) >> 63) // 32 or 64
 const UintSize = uintSize
 
-// shardCount is the number of paritions a muted is
+// shardCount is the number of paritions a mutex is
 // divided into such that mutexes can act independently
 // of each other to increase speed
 const shardCount = 256
