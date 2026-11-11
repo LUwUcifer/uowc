@@ -25,6 +25,10 @@ var (
 	ErrTrap             = errors.New("url: looks like a crawler trap")
 )
 
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
 type SanitizerConfig struct {
 	MaxURLLength      int
 	MaxPathSegments   int // deeper paths are treated as traps
@@ -69,122 +73,107 @@ func NewSanitizer(cfg SanitizerConfig) *Sanitizer {
 	return &Sanitizer{cfg: cfg}
 }
 
-// skipExt reports whether a lowercase extension should be skipped. A nil
-// config map means the built-in list.
-func (s *Sanitizer) skipExt(ext string) bool {
-	if s.cfg.SkipExtensions != nil {
-		_, ok := s.cfg.SkipExtensions[ext]
-		return ok
-	}
-	return isDefaultSkippedExt(ext)
-}
+// ---------------------------------------------------------------------------
+// Pipeline
+// ---------------------------------------------------------------------------
 
 // Sanitize resolves raw against base (which may be nil if raw is absolute)
 // and returns the canonical URL plus its host key ("host" or "host:port"),
 // which is what per-host queues and rate limiters should key on.
 //
-// Output is idempotent: sanitizing a canonical URL returns it unchanged.
+// Output is idempotent: sanitising a canonical URL returns it unchanged.
 // raw must already be HTML-entity decoded (the link scanner's job).
+//
+// Stages, each of which can reject the link with one of the Err* values:
+//
+//	cleanRaw      whitespace, control characters, length, backslashes
+//	resolveURL    parse, scheme check, resolve relative links against base
+//	checkHost     hostname or IP validation, private-address filtering
+//	buildHostKey  port validation, default port dropped
+//	cleanPath     dot segments, escapes, session IDs, traps, extensions
+//	cleanQuery    tracking params dropped, remainder sorted and re-encoded
+//	assemble      build the string, final length check
+//
+// The fragment and any credentials are dropped by never being copied.
 func (s *Sanitizer) Sanitize(base *url.URL, raw string) (canonical, hostKey string, err error) {
-	// 1. Whitespace and control characters, as browsers treat them.
-	raw = strings.TrimFunc(raw, func(r rune) bool {
-		//0x00 - 0x20 are control characters (NUL, Tab, Space)
-		return r <= 0x20
-	})
-	raw = strings.Map(func(r rune) rune {
-		if r == '\t' || r == '\n' || r == '\r' {
-			return -1
-		}
-		return r
-	}, raw)
-	if raw == "" || raw[0] == '#' {
-		return "", "", ErrEmpty
+	raw, err = s.cleanRaw(raw)
+	if err != nil {
+		return "", "", err
 	}
-	if len(raw) > s.cfg.MaxURLLength {
-		return "", "", ErrTooLong
+	u, err := resolveURL(base, raw)
+	if err != nil {
+		return "", "", err
 	}
-	for i := 0; i < len(raw); i++ {
-		if raw[i] < 0x20 || raw[i] == 0x7f {
-			return "", "", ErrControlChars
-		}
+	host, err := s.checkHost(strings.ToLower(u.Hostname()))
+	if err != nil {
+		return "", "", err
 	}
-
-	// 2. Backslashes before the query act as slashes in browsers.
-	raw = fixBackslashes(raw)
-
-	// 3. Parse, then branch on the link's own scheme. Each case validates the
-	// scheme of the URL it ends up using, so no re-check is needed afterwards.
-	ref, perr := url.Parse(raw)
-	if perr != nil {
-		return "", "", ErrParse
+	hostKey, err = buildHostKey(u, host)
+	if err != nil {
+		return "", "", err
 	}
-	var u *url.URL
-	switch ref.Scheme {
-	case "http", "https":
-		// Absolute link: it stands alone and the base is not needed.
-		u = ref
-	case "":
-		// Relative link (path-relative, root-relative, query-only or
-		// scheme-relative): resolve it against the page it was found on.
-		if base == nil || (base.Scheme != "http" && base.Scheme != "https") {
-			return "", "", ErrNoBase
-		}
-		u = base.ResolveReference(ref)
-	default:
-		// javascript:, mailto:, tel:, data:, ftp: and friends.
-		return "", "", ErrScheme
+	path, err := s.cleanPath(u.EscapedPath())
+	if err != nil {
+		return "", "", err
 	}
-	if u.Opaque != "" {
-		return "", "", ErrParse // e.g. "http:foo"
+	query, err := s.cleanQuery(u.RawQuery)
+	if err != nil {
+		return "", "", err
 	}
-
-	// 5. Host: lowercase, strip credentials and the trailing dot, validate.
-	host, herr := s.checkHost(strings.ToLower(u.Hostname()))
-	if herr != nil {
-		return "", "", herr
-	}
-
-	// 6. Port: validate range, drop the default.
-	hostKey = host
-	if p := u.Port(); p != "" {
-		n, aerr := strconv.Atoi(p)
-		if aerr != nil || n < 1 || n > 65535 {
-			return "", "", ErrPort
-		}
-		//port 80 is default for http, 443 for https, others point to different ports/pages
-		isDefault := (u.Scheme == "http" && n == 80) || (u.Scheme == "https" && n == 443)
-		if !isDefault {
-			hostKey = host + ":" + strconv.Itoa(n)
-		}
-	}
-
-	// 7. Path and query. The fragment is dropped by never copying it.
-	path, perr2 := s.cleanPath(u.EscapedPath())
-	if perr2 != nil {
-		return "", "", perr2
-	}
-	query, qerr := s.cleanQuery(u.RawQuery)
-	if qerr != nil {
-		return "", "", qerr
-	}
-
-	var b strings.Builder
-	b.Grow(len(u.Scheme) + 3 + len(hostKey) + len(path) + 1 + len(query))
-	b.WriteString(u.Scheme)
-	b.WriteString("://")
-	b.WriteString(hostKey)
-	b.WriteString(path)
-	if query != "" {
-		b.WriteByte('?')
-		b.WriteString(query)
-	}
-	canonical = b.String()
-	if len(canonical) > s.cfg.MaxURLLength {
-		return "", "", ErrTooLong
+	canonical, err = s.assemble(u.Scheme, hostKey, path, query)
+	if err != nil {
+		return "", "", err
 	}
 	return canonical, hostKey, nil
 }
 
+// ---------------------------------------------------------------------------
+// Stage 1: raw input hygiene
+// ---------------------------------------------------------------------------
+
+// cleanRaw trims and screens the raw href before it is parsed.
+func (s *Sanitizer) cleanRaw(raw string) (string, error) {
+	raw = strings.TrimFunc(raw, isTrimmable)
+	raw = strings.Map(dropLineBreaks, raw)
+	if raw == "" || raw[0] == '#' {
+		return "", ErrEmpty
+	}
+	if len(raw) > s.cfg.MaxURLLength {
+		return "", ErrTooLong
+	}
+	if hasControlByte(raw) {
+		return "", ErrControlChars
+	}
+	return fixBackslashes(raw), nil
+}
+
+// isTrimmable matches the space character and every ASCII control character
+// (0x00 to 0x1F). Browsers strip exactly these from both ends of a URL, so
+// unicode.IsSpace would be wrong: it misses NUL and friends, and it would
+// strip U+00A0, which browsers keep.
+func isTrimmable(r rune) bool { return r <= 0x20 }
+
+// dropLineBreaks removes tab, newline and carriage return anywhere in the
+// string, as browsers do.
+func dropLineBreaks(r rune) rune {
+	if r == '\t' || r == '\n' || r == '\r' {
+		return -1
+	}
+	return r
+}
+
+// hasControlByte reports whether s contains an ASCII control byte or DEL.
+func hasControlByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// fixBackslashes turns backslashes before the query or fragment into slashes,
+// as browsers do.
 func fixBackslashes(raw string) string {
 	end := strings.IndexAny(raw, "?#")
 	if end < 0 {
@@ -195,6 +184,44 @@ func fixBackslashes(raw string) string {
 	}
 	return strings.ReplaceAll(raw[:end], `\`, "/") + raw[end:]
 }
+
+// ---------------------------------------------------------------------------
+// Stage 2: parse and resolve
+// ---------------------------------------------------------------------------
+
+// resolveURL parses raw and branches on the link's own scheme. Each case
+// validates the scheme of the URL it ends up using, so no re-check is needed
+// afterwards.
+func resolveURL(base *url.URL, raw string) (*url.URL, error) {
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return nil, ErrParse
+	}
+	var u *url.URL
+	switch ref.Scheme {
+	case "http", "https":
+		// Absolute link: it stands alone and the base is not needed.
+		u = ref
+	case "":
+		// Relative link (path-relative, root-relative, query-only or
+		// scheme-relative): resolve it against the page it was found on.
+		if base == nil || (base.Scheme != "http" && base.Scheme != "https") {
+			return nil, ErrNoBase
+		}
+		u = base.ResolveReference(ref)
+	default:
+		// javascript:, mailto:, tel:, data:, ftp: and friends.
+		return nil, ErrScheme
+	}
+	if u.Opaque != "" {
+		return nil, ErrParse // e.g. "http:foo"
+	}
+	return u, nil
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: host
+// ---------------------------------------------------------------------------
 
 var (
 	cgnat = netip.MustParsePrefix("100.64.0.0/10")
@@ -210,73 +237,110 @@ func (s *Sanitizer) checkHost(h string) (string, error) {
 	if h == "" {
 		return "", ErrHost
 	}
-
-	// IPv6 literal.
 	if strings.Contains(h, ":") {
-		addr, err := netip.ParseAddr(h)
-		if err != nil || addr.Zone() != "" {
-			return "", ErrHost
-		}
-		//If IP Addr is IPv6 wrapping of IPv4, return IPv4
-		addr = addr.Unmap()
-		if !s.cfg.AllowPrivateHosts && !isPublicAddr(addr) {
-			return "", ErrPrivateHost
-		}
-		if addr.Is4() {
-			return addr.String(), nil
-		}
-		return "[" + addr.String() + "]", nil
+		return s.checkIPv6Literal(h)
 	}
 
 	h = strings.TrimSuffix(h, ".")
-	if h == "" || len(h) > 253 {
+	labels, err := splitHostLabels(h)
+	if err != nil {
+		return "", err
+	}
+
+	// A numeric last label means the host is meant as an IP address.
+	if last := labels[len(labels)-1]; allDigits(last) || strings.HasPrefix(last, "0x") {
+		return s.checkIPv4Literal(h)
+	}
+	if err := s.checkPrivateName(h, labels); err != nil {
+		return "", err
+	}
+	return h, nil
+}
+
+// checkIPv6Literal validates a bare IPv6 address (brackets already removed by
+// url.Hostname) and returns it bracketed. IPv4-mapped addresses are unwrapped
+// and checked as IPv4.
+func (s *Sanitizer) checkIPv6Literal(h string) (string, error) {
+	addr, err := netip.ParseAddr(h)
+	if err != nil || addr.Zone() != "" {
 		return "", ErrHost
 	}
-	// Plain ASCII only. This rejects non-ASCII (IDN) hosts
-	//Todo: Implement IDN hosts
+	addr = addr.Unmap()
+	if err := s.checkAddr(addr); err != nil {
+		return "", err
+	}
+	if addr.Is4() {
+		return addr.String(), nil
+	}
+	return "[" + addr.String() + "]", nil
+}
+
+// checkIPv4Literal accepts only strict dotted-quad IPv4, which rejects the
+// decimal, octal and hex tricks such as 2130706433, 0177.0.0.1 and 0x7f.0.0.1.
+func (s *Sanitizer) checkIPv4Literal(h string) (string, error) {
+	addr, err := netip.ParseAddr(h)
+	if err != nil || !addr.Is4() {
+		return "", ErrHost
+	}
+	if err := s.checkAddr(addr); err != nil {
+		return "", err
+	}
+	return addr.String(), nil
+}
+
+// checkAddr rejects loopback, private, link-local and other non-public
+// addresses unless AllowPrivateHosts is set.
+func (s *Sanitizer) checkAddr(addr netip.Addr) error {
+	if !s.cfg.AllowPrivateHosts && !isPublicAddr(addr) {
+		return ErrPrivateHost
+	}
+	return nil
+}
+
+// splitHostLabels checks the overall length, the character set and each dot
+// separated label of a hostname (trailing dot already removed).
+//
+// Only plain ASCII is allowed. That rejects non-ASCII (IDN) hosts
+//Todo: Implement IDN hosts
+
+func splitHostLabels(h string) ([]string, error) {
+	if h == "" || len(h) > 253 {
+		return nil, ErrHost
+	}
 	for i := 0; i < len(h); i++ {
-		c := h[i]
-		ok := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_'
-		if !ok {
-			return "", ErrHost
+		if !isHostByte(h[i]) {
+			return nil, ErrHost
 		}
 	}
 	labels := strings.Split(h, ".")
 	for _, l := range labels {
 		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
-			return "", ErrHost
+			return nil, ErrHost
 		}
 	}
+	return labels, nil
+}
 
-	// A numeric last label means the host is meant as an IP address. Only
-	// strict dotted-quad IPv4 is accepted, which rejects decimal, octal and
-	// hex tricks such as 2130706433, 0177.0.0.1 and 0x7f.0.0.1.
-	last := labels[len(labels)-1]
-	if allDigits(last) || strings.HasPrefix(last, "0x") {
-		addr, err := netip.ParseAddr(h)
-		if err != nil || !addr.Is4() {
-			return "", ErrHost
-		}
-		if !s.cfg.AllowPrivateHosts && !isPublicAddr(addr) {
-			return "", ErrPrivateHost
-		}
-		return addr.String(), nil
-	}
+func isHostByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_'
+}
 
-	if !s.cfg.AllowPrivateHosts {
-		if len(labels) < 2 { // single-label intranet names
-			return "", ErrPrivateHost
-		}
-		if h == "localhost" {
-			return "", ErrPrivateHost
-		}
-		for _, suf := range privateSuffixes {
-			if strings.HasSuffix(h, suf) {
-				return "", ErrPrivateHost
-			}
+// checkPrivateName rejects intranet-style names unless AllowPrivateHosts is
+// set. A single-label name (including "localhost") is an intranet name, and
+// the suffix list covers "anything.localhost", ".local" and similar.
+func (s *Sanitizer) checkPrivateName(h string, labels []string) error {
+	if s.cfg.AllowPrivateHosts {
+		return nil
+	}
+	if len(labels) < 2 {
+		return ErrPrivateHost
+	}
+	for _, suf := range privateSuffixes {
+		if strings.HasSuffix(h, suf) {
+			return ErrPrivateHost
 		}
 	}
-	return h, nil
+	return nil
 }
 
 func allDigits(s string) bool {
@@ -302,11 +366,45 @@ func isPublicAddr(a netip.Addr) bool {
 	return a.IsGlobalUnicast()
 }
 
+// ---------------------------------------------------------------------------
+// Stage 4: port and host key
+// ---------------------------------------------------------------------------
+
+// buildHostKey returns "host" or "host:port". The port is validated and
+// dropped when it is the default for the scheme, so "example.com:80" and
+// "example.com" over http share one key. A non-default port is a different
+// server, so it stays in the key.
+func buildHostKey(u *url.URL, host string) (string, error) {
+	p := u.Port()
+	if p == "" {
+		return host, nil
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return "", ErrPort
+	}
+	if isDefaultPort(u.Scheme, n) {
+		return host, nil
+	}
+	return host + ":" + strconv.Itoa(n), nil
+}
+
+// isDefaultPort reports whether n is the implied port for the scheme.
+func isDefaultPort(scheme string, n int) bool {
+	return (scheme == "http" && n == 80) || (scheme == "https" && n == 443)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5: path
+// ---------------------------------------------------------------------------
+
 // sessionPathKeys are path parameters such as /page;jsessionid=XYZ.
 var sessionPathKeys = map[string]struct{}{
 	"jsessionid": {}, "phpsessid": {}, "sid": {}, "sessionid": {},
 }
 
+// cleanPath normalises an escaped path: escapes, dot segments, session IDs,
+// trap limits and non-HTML extensions. An empty path becomes "/".
 func (s *Sanitizer) cleanPath(escaped string) (string, error) {
 	if escaped == "" {
 		return "/", nil
@@ -315,17 +413,33 @@ func (s *Sanitizer) cleanPath(escaped string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if p[0] != '/' {
+	segs, trailing, err := s.collapseSegments(p)
+	if err != nil {
+		return "", err
+	}
+	if len(segs) == 0 {
+		return "/", nil
+	}
+	if !trailing && s.hasSkippedExtension(segs[len(segs)-1]) {
+		return "", ErrSkippedExtension
+	}
+	return joinPath(segs, trailing), nil
+}
+
+// collapseSegments splits p on "/", resolves "." and "..", collapses "//",
+// strips path session IDs and enforces the trap limits. trailing reports
+// whether the path should end in a slash.
+func (s *Sanitizer) collapseSegments(p string) (segs []string, trailing bool, err error) {
+	if p == "" || p[0] != '/' {
 		p = "/" + p
 	}
+	trailing = strings.HasSuffix(p, "/")
+	parts := strings.Split(p, "/")[1:]
+	segs = make([]string, 0, len(parts))
+	repeats := make(map[string]int, len(parts))
 
-	trailing := strings.HasSuffix(p, "/")
-	segs := strings.Split(p, "/")[1:]
-	out := make([]string, 0, len(segs))
-	repeats := make(map[string]int, len(segs))
-
-	for i, seg := range segs {
-		isLast := i == len(segs)-1
+	for i, seg := range parts {
+		isLast := i == len(parts)-1
 		switch seg {
 		case "", ".":
 			// Collapses "//" and drops "./". A trailing "." keeps the slash.
@@ -334,49 +448,70 @@ func (s *Sanitizer) cleanPath(escaped string) (string, error) {
 			}
 			continue
 		case "..":
-			if len(out) > 0 {
-				out = out[:len(out)-1]
+			if len(segs) > 0 {
+				segs = segs[:len(segs)-1]
 			}
 			if isLast {
 				trailing = true
 			}
 			continue
 		}
-		if idx := strings.IndexByte(seg, ';'); idx >= 0 {
-			key, _, _ := strings.Cut(seg[idx+1:], "=")
-			if _, drop := sessionPathKeys[strings.ToLower(key)]; drop {
-				seg = seg[:idx]
-				if seg == "" {
-					continue
-				}
-			}
+		if seg = stripSessionParam(seg); seg == "" {
+			continue
 		}
 		repeats[seg]++
 		if repeats[seg] > s.cfg.MaxSegmentRepeat {
-			return "", ErrTrap
+			return nil, false, ErrTrap
 		}
-		out = append(out, seg)
-		if len(out) > s.cfg.MaxPathSegments {
-			return "", ErrTrap
+		segs = append(segs, seg)
+		if len(segs) > s.cfg.MaxPathSegments {
+			return nil, false, ErrTrap
 		}
 	}
+	return segs, trailing, nil
+}
 
-	if len(out) == 0 {
-		return "/", nil
+// stripSessionParam removes a path parameter such as ";jsessionid=ABC" from a
+// segment. Other ";" parameters are left alone.
+func stripSessionParam(seg string) string {
+	idx := strings.IndexByte(seg, ';')
+	if idx < 0 {
+		return seg
 	}
-	if !trailing {
-		last := out[len(out)-1]
-		if dot := strings.LastIndexByte(last, '.'); dot >= 0 && dot < len(last)-1 {
-			if s.skipExt(strings.ToLower(last[dot+1:])) {
-				return "", ErrSkippedExtension
-			}
-		}
+	key, _, _ := strings.Cut(seg[idx+1:], "=")
+	if _, drop := sessionPathKeys[strings.ToLower(key)]; drop {
+		return seg[:idx]
 	}
-	res := "/" + strings.Join(out, "/")
+	return seg
+}
+
+// hasSkippedExtension reports whether the last segment ends in an extension
+// that is not worth fetching, such as ".png" or ".pdf".
+func (s *Sanitizer) hasSkippedExtension(last string) bool {
+	dot := strings.LastIndexByte(last, '.')
+	if dot < 0 || dot == len(last)-1 {
+		return false
+	}
+	return s.skipExt(strings.ToLower(last[dot+1:]))
+}
+
+// skipExt reports whether a lowercase extension should be skipped. A nil
+// config map means the built-in list.
+func (s *Sanitizer) skipExt(ext string) bool {
+	if s.cfg.SkipExtensions != nil {
+		_, ok := s.cfg.SkipExtensions[ext]
+		return ok
+	}
+	return isDefaultSkippedExt(ext)
+}
+
+// joinPath rebuilds the path from its segments. segs must not be empty.
+func joinPath(segs []string, trailing bool) string {
+	res := "/" + strings.Join(segs, "/")
 	if trailing {
 		res += "/"
 	}
-	return res, nil
+	return res
 }
 
 // normalizeEscapes decodes escapes of unreserved characters (%41 -> A),
@@ -425,7 +560,8 @@ func normalizeEscapes(s string) (string, error) {
 		if !ok1 || !ok2 {
 			return "", ErrParse
 		}
-		d := (hi << 4) | lo
+		// Combine the two hex digits into one byte: %2F -> (2<<4)|15 = 0x2F.
+		d := hi<<4 | lo
 		switch {
 		case d < 0x20 || d == 0x7f:
 			return "", ErrControlChars
@@ -458,6 +594,10 @@ func isUnreserved(c byte) bool {
 		c == '-' || c == '.' || c == '_' || c == '~'
 }
 
+// ---------------------------------------------------------------------------
+// Stage 6: query
+// ---------------------------------------------------------------------------
+
 var dropParams = map[string]struct{}{
 	// Ad and analytics click IDs.
 	"fbclid": {}, "gclid": {}, "gclsrc": {}, "dclid": {}, "gbraid": {}, "wbraid": {},
@@ -469,6 +609,8 @@ var dropParams = map[string]struct{}{
 	"phpsessid": {}, "jsessionid": {}, "sid": {}, "sessionid": {}, "session_id": {}, "sessid": {},
 }
 
+// isDropParam reports whether a lowercase parameter name is tracking or
+// session noise that does not change the page.
 func isDropParam(lowerKey string) bool {
 	if strings.HasPrefix(lowerKey, "utm_") || strings.HasPrefix(lowerKey, "aspsessionid") {
 		return true
@@ -488,8 +630,19 @@ func (s *Sanitizer) cleanQuery(raw string) (string, error) {
 	if raw == "" {
 		return "", nil
 	}
+	pairs, err := s.parseQuery(raw)
+	if err != nil || len(pairs) == 0 {
+		return "", err
+	}
+	sort.SliceStable(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+	return encodeQuery(pairs), nil
+}
+
+// parseQuery splits the raw query into decoded key/value pairs, skipping empty
+// and tracking parameters and enforcing the parameter limit.
+func (s *Sanitizer) parseQuery(raw string) ([]queryPair, error) {
 	pairs := make([]queryPair, 0, 8)
-	for part := range strings.SplitSeq(raw, "&") {
+	for _, part := range strings.Split(raw, "&") {
 		if part == "" {
 			continue
 		}
@@ -513,14 +666,15 @@ func (s *Sanitizer) cleanQuery(raw string) (string, error) {
 		}
 		pairs = append(pairs, queryPair{dk, dv, hasEq})
 		if len(pairs) > s.cfg.MaxQueryParams {
-			return "", ErrTrap
+			return nil, ErrTrap
 		}
 	}
-	if len(pairs) == 0 {
-		return "", nil
-	}
-	sort.SliceStable(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+	return pairs, nil
+}
 
+// encodeQuery re-encodes pairs as "k=v&k2=v2". A key that had no "=" in the
+// input stays without one.
+func encodeQuery(pairs []queryPair) string {
 	var b strings.Builder
 	for i, p := range pairs {
 		if i > 0 {
@@ -532,8 +686,36 @@ func (s *Sanitizer) cleanQuery(raw string) (string, error) {
 			b.WriteString(url.QueryEscape(p.val))
 		}
 	}
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7: assemble
+// ---------------------------------------------------------------------------
+
+// assemble builds scheme://hostKey/path[?query] and enforces the length limit
+// on the result. The input length was checked in cleanRaw, but normalisation
+// can make the output longer (non-ASCII bytes and spaces become %XX).
+func (s *Sanitizer) assemble(scheme, hostKey, path, query string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(scheme) + 3 + len(hostKey) + len(path) + 1 + len(query))
+	b.WriteString(scheme)
+	b.WriteString("://")
+	b.WriteString(hostKey)
+	b.WriteString(path)
+	if query != "" {
+		b.WriteByte('?')
+		b.WriteString(query)
+	}
+	if b.Len() > s.cfg.MaxURLLength {
+		return "", ErrTooLong
+	}
 	return b.String(), nil
 }
+
+// ---------------------------------------------------------------------------
+// Built-in extension list
+// ---------------------------------------------------------------------------
 
 // isDefaultSkippedExt reports whether ext (lowercase, no dot) is a non-HTML
 // file type that is not worth fetching. A switch needs no setup, allocates
